@@ -1,0 +1,1028 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Loader2,
+  Sparkles,
+  Download,
+  FileText,
+  Languages,
+  Wand2,
+  CheckCircle2,
+  AlertTriangle,
+  Trash2,
+  Copy,
+} from "lucide-react";
+
+/**
+ * ČÍTANIE S POROZUMENÍM – GENERÁTOR (MVP)
+ *
+ * ✅ UI: jazyk (EN/DE/FR/Vlastný), CEFR, dĺžka, téma, cieľová slovná zásoba (tagy), prepínač cvičení,
+ *    checkboxy typov cvičení, generovanie kľúča, export (PDF/DOCX) – ukážkové stub tlačidlá.
+ * ✅ Generovanie: používa lokálny "mock" generátor – pripravené na napojenie na LLM API.
+ * ✅ Profesionálny vzhľad: moderné karty, jemné animácie, prehľadný layout.
+ *
+ * 🔌 Ako napojiť na LLM:
+ * - v handleGenerate() nahraď mockGenerate(...) volaním na vlastný endpoint (/api/generate)
+ * - endpoint zavolá LLM (napr. OpenAI) a vráti JSON: { passage, vocabulary, exercises, answerKey }
+ *
+ * 📄 Export PDF/DOCX:
+ * - v handleExport(...) integruj napr.:
+ *   - PDF: @react-pdf/renderer alebo server-side (Puppeteer)
+ *   - DOCX: docx (npm) alebo server-side templating
+ */
+
+const LANG_PRESETS = [
+  { value: "en", label: "English" },
+  { value: "de", label: "Deutsch" },
+  { value: "fr", label: "Français" },
+  { value: "custom", label: "Vlastný jazyk" },
+] as const;
+
+const CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"] as const;
+
+const EXERCISE_TYPES = [
+  { key: "matching", label: "Spájačky" },
+  { key: "gapfill", label: "Doplňovačky" },
+  { key: "mcq", label: "Výber z možností" },
+  { key: "open", label: "Otvorené otázky" },
+  { key: "discussion", label: "Otázky do diskusie" },
+] as const;
+
+type ExerciseKey = (typeof EXERCISE_TYPES)[number]["key"];
+
+type Generated = {
+  title: string;
+  languageLabel: string;
+  topic: string;
+  cefr: string;
+  lengthWords: number;
+  vocabulary: string[];
+  passage: string;
+  exercises?: Record<ExerciseKey, any>;
+  answerKey?: Record<ExerciseKey, any>;
+};
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr.map((s) => s.trim()).filter(Boolean)));
+}
+
+function splitToTags(raw: string) {
+  // rozdelí podľa čiarky, bodkočiarky alebo nového riadku
+  return uniq(
+    raw
+      .split(/[,;\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+
+function estimateWordsFromLength(length: string) {
+  // "very short" -> 90, "short" -> 140, "medium" -> 200, "long" -> 280
+  switch (length) {
+    case "very_short":
+      return 90;
+    case "short":
+      return 140;
+    case "medium":
+      return 200;
+    case "long":
+      return 280;
+    case "very_long":
+      return 380;
+    default:
+      return 200;
+  }
+}
+
+function prettyLang(value: string, custom: string) {
+  if (value === "en") return "English";
+  if (value === "de") return "Deutsch";
+  if (value === "fr") return "Français";
+  return custom?.trim() ? custom.trim() : "Vlastný jazyk";
+}
+
+function buildPrompt(params: {
+  language: string;
+  customLanguage: string;
+  cefr: string;
+  length: string;
+  topic: string;
+  vocabTags: string[];
+  autoVocab: boolean;
+  wantExercises: boolean;
+  exerciseTypes: ExerciseKey[];
+}) {
+  const lang = prettyLang(params.language, params.customLanguage);
+  const words = estimateWordsFromLength(params.length);
+  const vocabLine = params.autoVocab
+    ? "Vyber vhodnú cieľovú slovnú zásobu sám podľa témy (10–16 slov)."
+    : `Použi presne tieto cieľové slovíčka: ${params.vocabTags.join(", ")}.`;
+
+  const exLine = params.wantExercises
+    ? `Pridaj cvičenia: ${params.exerciseTypes
+        .map((k) => EXERCISE_TYPES.find((x) => x.key === k)?.label)
+        .filter(Boolean)
+        .join(", ")}. Pridaj aj kľúč odpovedí.`
+    : "Cvičenia nepridávaj.";
+
+  return `Si skúsený učiteľ cudzích jazykov a tvorca učebných materiálov.\n\nVygeneruj text na čítanie s porozumením v jazyku: ${lang}.\nCEFR úroveň: ${params.cefr}.\nTéma: ${params.topic || "(nezadané)"}.\nDĺžka: približne ${words} slov.\n\n${vocabLine}\n\nZadanie:\n1) Vytvor názov.\n2) Napíš text v 2–4 odsekoch, prirodzený jazyk vhodný pre úroveň.\n3) Potom uveď zoznam cieľovej slovnej zásoby (10–16 položiek).\n4) ${exLine}\n\nFormátuj čisto a prehľadne.`;
+}
+
+/**
+ * Mock generovanie (bez API). Účel: UI demo + štruktúra výstupu.
+ * Nahraditeľné volaním serveru.
+ */
+async function mockGenerate(input: {
+  language: string;
+  customLanguage: string;
+  cefr: string;
+  length: string;
+  topic: string;
+  vocabTags: string[];
+  autoVocab: boolean;
+  wantExercises: boolean;
+  exerciseTypes: ExerciseKey[];
+}): Promise<Generated> {
+  await new Promise((r) => setTimeout(r, 900));
+
+  const langLabel = prettyLang(input.language, input.customLanguage);
+  const lengthWords = estimateWordsFromLength(input.length);
+
+  const seedVocab = [
+    "habit",
+    "challenge",
+    "improve",
+    "focus",
+    "routine",
+    "notice",
+    "support",
+    "goal",
+    "progress",
+    "feedback",
+    "curious",
+    "strategy",
+    "practice",
+    "confidence",
+    "collaboration",
+  ];
+
+  const vocab = input.autoVocab
+    ? seedVocab
+        .slice(0, clamp(Math.round(lengthWords / 20), 10, 16))
+        .map((w) => w.toLowerCase())
+    : input.vocabTags;
+
+  const topic = input.topic?.trim() || "Daily life and learning";
+
+  const title = `Reading: ${topic}`;
+
+  const baseText =
+    langLabel === "Deutsch"
+      ? `Heute möchte ich dir eine kurze Geschichte über „${topic}“ erzählen. Sie zeigt, wie kleine Gewohnheiten große Veränderungen bringen können.\n\nAm Anfang war alles chaotisch, aber dann hat Mia angefangen, jeden Tag zehn Minuten zu üben. Sie hat nicht alles sofort verstanden, doch sie blieb neugierig und hat nach Feedback gefragt.\n\nMit der Zeit wurde sie sicherer. Sie merkte, dass eine klare Routine hilft, stressige Momente zu meistern. Am Ende hat sie sogar ihre Freunde motiviert, zusammen zu lernen.`
+      : langLabel === "Français"
+      ? `Aujourd’hui, je vais te raconter une courte histoire sur « ${topic} ». Elle montre comment de petites habitudes peuvent changer beaucoup de choses.\n\nAu début, tout semblait difficile, puis Mia a commencé à pratiquer dix minutes par jour. Elle ne comprenait pas tout tout de suite, mais elle est restée curieuse et a demandé du feedback.\n\nAvec le temps, elle a gagné en confiance. Elle a remarqué qu’une routine claire aide à gérer le stress. Finalement, elle a même motivé ses amis à apprendre ensemble.`
+      : langLabel === "English"
+      ? `Today I want to share a short story about “${topic}”. It shows how small habits can create big changes.\n\nAt first, everything felt messy, but then Mia started to practise for ten minutes every day. She didn’t understand everything immediately, yet she stayed curious and asked for feedback.\n\nOver time, she became more confident. She noticed that a clear routine helps in stressful moments. In the end, she even motivated her friends to learn together.`
+      : `Text in ${langLabel}: A short reading about “${topic}”.\n\nMia tries a new routine. She practises a little each day, asks for feedback, and feels more confident.\n\nIn the end, she shares her strategy with friends and they collaborate.`;
+
+  // približná úprava dĺžky – len pre demo
+  const fillerSentence =
+    langLabel === "Deutsch"
+      ? " Sie macht kleine Schritte und sieht jeden Tag Fortschritt."
+      : langLabel === "Français"
+      ? " Elle fait de petits pas et voit des progrès chaque jour."
+      : langLabel === "English"
+      ? " She takes small steps and sees progress every day."
+      : " Small steps bring visible progress each day.";
+
+  const target = lengthWords;
+  const wordsNow = baseText.split(/\s+/).length;
+  const extra = clamp(Math.round((target - wordsNow) / 12), 0, 18);
+  const passage =
+    baseText +
+    (extra > 0
+      ? "\n\n" + new Array(extra).fill(fillerSentence).join("")
+      : "");
+
+  let exercises: any = undefined;
+  let answerKey: any = undefined;
+
+  if (input.wantExercises && input.exerciseTypes.length) {
+    exercises = {};
+    answerKey = {};
+
+    if (input.exerciseTypes.includes("matching")) {
+      const pairs = vocab.slice(0, 8).map((w, i) => ({
+        term: w,
+        def: `Definition ${i + 1} (demo)`
+      }));
+      exercises.matching = {
+        instruction:
+          "Match the words to the definitions (demo content).",
+        pairs,
+      };
+      answerKey.matching = {
+        matches: pairs.map((p) => ({ term: p.term, def: p.def })),
+      };
+    }
+
+    if (input.exerciseTypes.includes("gapfill")) {
+      const blanks = vocab.slice(0, 8);
+      exercises.gapfill = {
+        instruction:
+          "Complete the sentences with the correct word (demo content).",
+        items: blanks.map((w, i) => ({
+          sentence: `Sentence ${i + 1}: I will ____ today.`,
+          options: blanks.slice(0, 4),
+        })),
+      };
+      answerKey.gapfill = {
+        answers: blanks.map((w, i) => ({ index: i + 1, answer: w })),
+      };
+    }
+
+    if (input.exerciseTypes.includes("mcq")) {
+      exercises.mcq = {
+        instruction: "Choose the best answer (demo content).",
+        items: [
+          {
+            q: "What is the main idea of the text?",
+            options: [
+              "Big changes need big actions",
+              "Small habits can create progress",
+              "Learning is always easy",
+              "Routine never helps",
+            ],
+          },
+        ],
+      };
+      answerKey.mcq = { answers: [{ index: 1, answer: 2 }] };
+    }
+
+    if (input.exerciseTypes.includes("open")) {
+      exercises.open = {
+        instruction: "Answer in 1–2 sentences (demo content).",
+        questions: [
+          "What did Mia change in her routine?",
+          "How did she feel over time?",
+        ],
+      };
+      answerKey.open = {
+        sample: [
+          "She started practising for a short time every day.",
+          "She became more confident and managed stress better.",
+        ],
+      };
+    }
+
+    if (input.exerciseTypes.includes("discussion")) {
+      exercises.discussion = {
+        instruction: "Discuss with a partner (demo content).",
+        prompts: [
+          "What habit would help you learn better?",
+          "How do you like to get feedback?",
+        ],
+      };
+      answerKey.discussion = { note: "No fixed answers." };
+    }
+  }
+
+  return {
+    title,
+    languageLabel: langLabel,
+    topic,
+    cefr: input.cefr,
+    lengthWords,
+    vocabulary: vocab,
+    passage,
+    exercises,
+    answerKey,
+  };
+}
+
+function SectionTitle({ icon: Icon, title }: any) {
+  return (
+    <div className="flex items-center gap-2">
+      <div className="rounded-2xl bg-muted p-2">
+        <Icon className="h-4 w-4" />
+      </div>
+      <h3 className="text-sm font-semibold tracking-tight">{title}</h3>
+    </div>
+  );
+}
+
+function ChipInput({
+  value,
+  onChange,
+  tags,
+  setTags,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  tags: string[];
+  setTags: (t: string[]) => void;
+  placeholder?: string;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    // ak používateľ napíše čiarku, okamžite premeniť na tagy
+    if (value.includes(",") || value.includes(";") || value.includes("\n")) {
+      const newTags = splitToTags(value);
+      if (newTags.length) {
+        setTags(uniq([...tags, ...newTags]));
+        onChange("");
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  const removeTag = (t: string) => {
+    setTags(tags.filter((x) => x !== t));
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-2">
+        {tags.map((t) => (
+          <Badge
+            key={t}
+            variant="secondary"
+            className="rounded-2xl px-3 py-1 text-sm"
+          >
+            <span className="mr-2">{t}</span>
+            <button
+              onClick={() => removeTag(t)}
+              className="opacity-70 hover:opacity-100"
+              aria-label={`Remove ${t}`}
+            >
+              ×
+            </button>
+          </Badge>
+        ))}
+      </div>
+      <Input
+        ref={inputRef}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder || "Zadaj slovíčka oddelené čiarkou…"}
+      />
+    </div>
+  );
+}
+
+function formatWorksheet(gen: Generated) {
+  const lines: string[] = [];
+  lines.push(gen.title);
+  lines.push("");
+  lines.push(`Language: ${gen.languageLabel}`);
+  lines.push(`CEFR: ${gen.cefr} · Target length: ~${gen.lengthWords} words`);
+  lines.push(`Topic: ${gen.topic}`);
+  lines.push("");
+  lines.push("TEXT");
+  lines.push(gen.passage);
+  lines.push("");
+  lines.push("VOCABULARY");
+  lines.push(gen.vocabulary.map((w, i) => `${i + 1}. ${w}`).join("\n"));
+
+  if (gen.exercises) {
+    lines.push("");
+    lines.push("EXERCISES");
+    for (const [k, payload] of Object.entries(gen.exercises)) {
+      const label = EXERCISE_TYPES.find((x) => x.key === k)?.label || k;
+      lines.push("");
+      lines.push(label.toUpperCase());
+      lines.push(payload.instruction || "");
+      if (k === "matching") {
+        lines.push(
+          payload.pairs
+            .map((p: any, i: number) => `${i + 1}) ${p.term}  —  ____`)
+            .join("\n")
+        );
+        lines.push("\nDefinitions:");
+        lines.push(payload.pairs.map((p: any, i: number) => `${String.fromCharCode(65 + i)}) ${p.def}`).join("\n"));
+      }
+      if (k === "gapfill") {
+        lines.push(payload.items.map((it: any, i: number) => `${i + 1}) ${it.sentence}`).join("\n"));
+        lines.push("\nWord bank:");
+        const bank = Array.from(new Set(payload.items.flatMap((it: any) => it.options || [])));
+        lines.push(bank.join(", "));
+      }
+      if (k === "mcq") {
+        lines.push(
+          payload.items
+            .map((it: any, i: number) =>
+              `${i + 1}) ${it.q}\n   ${it.options
+                .map((o: string, j: number) => `${String.fromCharCode(65 + j)}) ${o}`)
+                .join("\n   ")}`
+            )
+            .join("\n\n")
+        );
+      }
+      if (k === "open") {
+        lines.push(payload.questions.map((q: string, i: number) => `${i + 1}) ${q}`).join("\n"));
+      }
+      if (k === "discussion") {
+        lines.push(payload.prompts.map((q: string, i: number) => `${i + 1}) ${q}`).join("\n"));
+      }
+    }
+
+    if (gen.answerKey) {
+      lines.push("");
+      lines.push("ANSWER KEY");
+      for (const [k, payload] of Object.entries(gen.answerKey)) {
+        const label = EXERCISE_TYPES.find((x) => x.key === k)?.label || k;
+        lines.push("");
+        lines.push(label.toUpperCase());
+        lines.push(JSON.stringify(payload, null, 2));
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export default function ReadingComprehensionGeneratorApp() {
+  const [language, setLanguage] = useState<(typeof LANG_PRESETS)[number]["value"]>(
+    "en"
+  );
+  const [customLanguage, setCustomLanguage] = useState("");
+
+  const [cefr, setCefr] = useState<(typeof CEFR_LEVELS)[number]>("B1");
+  const [length, setLength] = useState<
+    "very_short" | "short" | "medium" | "long" | "very_long"
+  >("medium");
+
+  const [topic, setTopic] = useState("Teen life and wellbeing");
+
+  const [autoVocab, setAutoVocab] = useState(true);
+  const [vocabRaw, setVocabRaw] = useState("");
+  const [vocabTags, setVocabTags] = useState<string[]>([]);
+
+  const [wantExercises, setWantExercises] = useState(false);
+  const [exerciseTypes, setExerciseTypes] = useState<ExerciseKey[]>([
+    "mcq",
+    "open",
+  ]);
+
+  const [isLoading, setIsLoading] = useState(false);
+  const [generated, setGenerated] = useState<Generated | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const [promptOpen, setPromptOpen] = useState(false);
+
+  const langLabel = useMemo(
+    () => prettyLang(language, customLanguage),
+    [language, customLanguage]
+  );
+
+  const computedPrompt = useMemo(() =>
+    buildPrompt({
+      language,
+      customLanguage,
+      cefr,
+      length,
+      topic,
+      vocabTags,
+      autoVocab,
+      wantExercises,
+      exerciseTypes,
+    }),
+  [language, customLanguage, cefr, length, topic, vocabTags, autoVocab, wantExercises, exerciseTypes]);
+
+  const toggleExercise = (key: ExerciseKey) => {
+    setExerciseTypes((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    );
+  };
+
+  const canGenerate = useMemo(() => {
+    if (language === "custom" && !customLanguage.trim()) return false;
+    if (!topic.trim()) return false;
+    if (!autoVocab && vocabTags.length === 0) return false;
+    if (wantExercises && exerciseTypes.length === 0) return false;
+    return true;
+  }, [language, customLanguage, topic, autoVocab, vocabTags, wantExercises, exerciseTypes]);
+
+  async function handleGenerate() {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const data = await mockGenerate({
+        language,
+        customLanguage,
+        cefr,
+        length,
+        topic,
+        vocabTags,
+        autoVocab,
+        wantExercises,
+        exerciseTypes,
+      });
+      setGenerated(data);
+    } catch (e: any) {
+      setError("Nepodarilo sa vygenerovať obsah. Skús to prosím ešte raz.");
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  function handleCopy() {
+    if (!generated) return;
+    const txt = formatWorksheet(generated);
+    navigator.clipboard.writeText(txt);
+  }
+
+  function handleClear() {
+    setGenerated(null);
+    setError(null);
+  }
+
+  function handleExport(kind: "pdf" | "docx") {
+    // MVP: stiahnutie ako .txt (placeholder). V produkcii to nahraď reálnym exportom.
+    if (!generated) return;
+    const content = formatWorksheet(generated);
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(generated.title || "worksheet").replace(/[^a-z0-9\-_ ]/gi, "").trim().replace(/\s+/g, "-").toLowerCase()}.${kind}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="min-h-screen w-full bg-background">
+      <div className="mx-auto max-w-6xl px-4 py-8">
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 flex flex-col gap-2"
+        >
+          <div className="flex items-center gap-3">
+            <div className="rounded-2xl bg-muted p-2">
+              <Languages className="h-5 w-5" />
+            </div>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Generátor čítania s porozumením
+            </h1>
+            <Badge variant="secondary" className="rounded-2xl">
+              MVP
+            </Badge>
+          </div>
+          <p className="text-muted-foreground">
+            Vyber jazyk, úroveň, dĺžku, tému, slovnú zásobu a voliteľné cvičenia.
+            Výstup môžeš stiahnuť ako PDF alebo DOCX (v MVP ako placeholder export).
+          </p>
+        </motion.div>
+
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* LEFT: SETTINGS */}
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Wand2 className="h-4 w-4" /> Nastavenia generovania
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>Jazyk</Label>
+                  <Select
+                    value={language}
+                    onValueChange={(v: any) => setLanguage(v)}
+                  >
+                    <SelectTrigger className="rounded-2xl">
+                      <SelectValue placeholder="Vyber jazyk" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {LANG_PRESETS.map((l) => (
+                        <SelectItem key={l.value} value={l.value}>
+                          {l.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>CEFR úroveň</Label>
+                  <Select value={cefr} onValueChange={(v: any) => setCefr(v)}>
+                    <SelectTrigger className="rounded-2xl">
+                      <SelectValue placeholder="Vyber úroveň" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CEFR_LEVELS.map((l) => (
+                        <SelectItem key={l} value={l}>
+                          {l}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Dĺžka textu</Label>
+                  <Select value={length} onValueChange={(v: any) => setLength(v)}>
+                    <SelectTrigger className="rounded-2xl">
+                      <SelectValue placeholder="Vyber dĺžku" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="very_short">Veľmi krátky (~90)</SelectItem>
+                      <SelectItem value="short">Krátky (~140)</SelectItem>
+                      <SelectItem value="medium">Stredný (~200)</SelectItem>
+                      <SelectItem value="long">Dlhý (~280)</SelectItem>
+                      <SelectItem value="very_long">Veľmi dlhý (~380)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Téma</Label>
+                  <Input
+                    className="rounded-2xl"
+                    value={topic}
+                    onChange={(e) => setTopic(e.target.value)}
+                    placeholder="Napr. Animals, School life, Space…"
+                  />
+                </div>
+              </div>
+
+              <AnimatePresence>
+                {language === "custom" && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="space-y-2"
+                  >
+                    <Label>Vlastný jazyk (napíš cieľový jazyk)</Label>
+                    <Input
+                      className="rounded-2xl"
+                      value={customLanguage}
+                      onChange={(e) => setCustomLanguage(e.target.value)}
+                      placeholder='Napr. "Spanish", "Italian", "Slovenčina"…'
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <Separator />
+
+              <div className="space-y-3">
+                <SectionTitle icon={Sparkles} title="Cieľová slovná zásoba" />
+
+                <div className="flex items-center justify-between rounded-2xl border p-3">
+                  <div className="space-y-0.5">
+                    <div className="text-sm font-medium">Vybrať slovnú zásobu automaticky</div>
+                    <div className="text-xs text-muted-foreground">
+                      Ak vypneš, zadáš vlastné slovíčka a zmenia sa na štítky.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={autoVocab}
+                    onCheckedChange={(v) => setAutoVocab(!!v)}
+                  />
+                </div>
+
+                <AnimatePresence>
+                  {!autoVocab && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="space-y-2"
+                    >
+                      <Label>Slovíčka (oddelené čiarkou)</Label>
+                      <ChipInput
+                        value={vocabRaw}
+                        onChange={setVocabRaw}
+                        tags={vocabTags}
+                        setTags={setVocabTags}
+                        placeholder="napr. habit, routine, stress, feedback"
+                      />
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="secondary"
+                          className="rounded-2xl"
+                          onClick={() => {
+                            const newTags = splitToTags(vocabRaw);
+                            setVocabTags(uniq([...vocabTags, ...newTags]));
+                            setVocabRaw("");
+                          }}
+                        >
+                          Pridať
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          className="rounded-2xl"
+                          onClick={() => setVocabTags([])}
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" /> Vymazať tagy
+                        </Button>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              <Separator />
+
+              <div className="space-y-3">
+                <SectionTitle icon={FileText} title="Cvičenia" />
+                <div className="flex items-center justify-between rounded-2xl border p-3">
+                  <div className="space-y-0.5">
+                    <div className="text-sm font-medium">Chcem pridať cvičenia</div>
+                    <div className="text-xs text-muted-foreground">
+                      Vyber typy aktivít a vygeneruje sa aj kľúč odpovedí.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={wantExercises}
+                    onCheckedChange={(v) => setWantExercises(!!v)}
+                  />
+                </div>
+
+                <AnimatePresence>
+                  {wantExercises && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="grid grid-cols-1 gap-2 md:grid-cols-2"
+                    >
+                      {EXERCISE_TYPES.map((t) => (
+                        <label
+                          key={t.key}
+                          className="flex items-center gap-3 rounded-2xl border p-3 hover:bg-muted/40"
+                        >
+                          <Checkbox
+                            checked={exerciseTypes.includes(t.key)}
+                            onCheckedChange={() => toggleExercise(t.key)}
+                          />
+                          <span className="text-sm">{t.label}</span>
+                        </label>
+                      ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              <Separator />
+
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div className="text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground">Aktuálny jazyk:</span> {langLabel}
+                  {" · "}
+                  <span className="font-medium text-foreground">Prompt:</span>{" "}
+                  <button
+                    className="underline underline-offset-4 hover:opacity-80"
+                    onClick={() => setPromptOpen(true)}
+                  >
+                    zobraziť
+                  </button>
+                </div>
+
+                <Button
+                  className="rounded-2xl"
+                  onClick={handleGenerate}
+                  disabled={!canGenerate || isLoading}
+                >
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Generujem…
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="mr-2 h-4 w-4" /> Generovať
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              {!canGenerate && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4" />
+                    <div>
+                      Skontroluj povinné polia: téma, vlastný jazyk (ak je zvolený),
+                      slovná zásoba (ak nie je automatická), typy cvičení (ak sú zapnuté).
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {error && (
+                <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+                  {error}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* RIGHT: OUTPUT */}
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <CheckCircle2 className="h-4 w-4" /> Výstup
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {!generated ? (
+                <div className="rounded-2xl border border-dashed p-6">
+                  <div className="text-sm text-muted-foreground">
+                    Tu sa zobrazí vygenerovaný text, slovná zásoba, cvičenia a kľúč.
+                  </div>
+                  <div className="mt-3 text-xs text-muted-foreground">
+                    Tip: Pre rýchle testovanie nechaj zapnutú automatickú slovnú zásobu a
+                    zvoľ 2–3 typy cvičení.
+                  </div>
+                </div>
+              ) : (
+                <motion.div
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="space-y-4"
+                >
+                  <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <div className="text-lg font-semibold tracking-tight">
+                        {generated.title}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        {generated.languageLabel} · CEFR {generated.cefr} · ~{generated.lengthWords} slov
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="secondary"
+                        className="rounded-2xl"
+                        onClick={handleCopy}
+                      >
+                        <Copy className="mr-2 h-4 w-4" /> Kopírovať
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        className="rounded-2xl"
+                        onClick={() => handleExport("pdf")}
+                      >
+                        <Download className="mr-2 h-4 w-4" /> PDF
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        className="rounded-2xl"
+                        onClick={() => handleExport("docx")}
+                      >
+                        <Download className="mr-2 h-4 w-4" /> DOCX
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        className="rounded-2xl"
+                        onClick={handleClear}
+                      >
+                        <Trash2 className="mr-2 h-4 w-4" /> Vymazať
+                      </Button>
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  <div className="space-y-2">
+                    <div className="text-sm font-semibold">Text</div>
+                    <div className="whitespace-pre-wrap rounded-2xl border p-4 text-sm leading-relaxed">
+                      {generated.passage}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="text-sm font-semibold">Slovná zásoba</div>
+                    <div className="flex flex-wrap gap-2">
+                      {generated.vocabulary.map((w) => (
+                        <Badge key={w} variant="secondary" className="rounded-2xl">
+                          {w}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+
+                  {generated.exercises && (
+                    <div className="space-y-3">
+                      <div className="text-sm font-semibold">Cvičenia</div>
+                      <div className="space-y-3">
+                        {Object.entries(generated.exercises).map(([k, payload]: any) => {
+                          const label =
+                            EXERCISE_TYPES.find((x) => x.key === k)?.label || k;
+                          return (
+                            <div key={k} className="rounded-2xl border p-4">
+                              <div className="mb-2 text-sm font-semibold">
+                                {label}
+                              </div>
+                              <div className="text-sm text-muted-foreground">
+                                {payload.instruction}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {generated.answerKey && (
+                    <div className="space-y-2">
+                      <div className="text-sm font-semibold">Kľúč odpovedí</div>
+                      <div className="rounded-2xl border p-4 text-xs">
+                        <pre className="overflow-auto whitespace-pre-wrap">
+{JSON.stringify(generated.answerKey, null, 2)}
+                        </pre>
+                      </div>
+                    </div>
+                  )}
+                </motion.div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        <Dialog open={promptOpen} onOpenChange={setPromptOpen}>
+          <DialogContent className="max-w-3xl rounded-2xl">
+            <DialogHeader>
+              <DialogTitle>Prompt, ktorý sa pošle do LLM</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="rounded-2xl border p-4 text-sm">
+                <pre className="whitespace-pre-wrap leading-relaxed">
+{computedPrompt}
+                </pre>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="secondary"
+                  className="rounded-2xl"
+                  onClick={() => {
+                    navigator.clipboard.writeText(computedPrompt);
+                  }}
+                >
+                  <Copy className="mr-2 h-4 w-4" /> Kopírovať prompt
+                </Button>
+                <Button className="rounded-2xl" onClick={() => setPromptOpen(false)}>
+                  Zavrieť
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <div className="mt-8 rounded-2xl border bg-muted/20 p-5 text-sm">
+          <div className="font-semibold">Poznámka k produkcii (prakticky):</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
+            <li>
+              Pridaj server endpoint <code>/api/generate</code> (Next.js route),
+              ktorý zavolá LLM a vráti štruktúrovaný JSON.
+            </li>
+            <li>
+              Export PDF/DOCX rieš server-side (najspoľahlivejšie), aby bol layout
+              identický v každom prehliadači.
+            </li>
+            <li>
+              Ak chceš, doplním aj šablónu pracovného listu (header, meno, dátum,
+              QR kód, stránkovanie) a „teacher/student“ verziu.
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
